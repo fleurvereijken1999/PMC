@@ -1,0 +1,404 @@
+---
+title: "BULK_rna-seq_analysis"
+output: html_notebook
+---
+
+
+#load required packages
+```{r}
+library(ggplot2)
+library(tidyr)
+library(dplyr)
+library(janitor)
+library(limma)
+library(Seurat)
+library(tibble)
+library(openxlsx)
+library(data.table)
+library(survival)
+library(survminer)
+```
+
+
+#Prepare RNA-seq dataframe and metadata
+```{r}
+#load data from pediatric brain tumor study
+PBTA <- read.csv('pbta_all (1).tar/pbta_all (1)/deployment/public/pbta_all/data_rna_seq_v2_mrna.txt', sep = '\t',header = T)
+PBTA <- data.table::transpose(PBTA, keep.names = 'Sample.ID', make.names = names(PBTA[1]))
+PBTA[1] <- lapply(PBTA[1], gsub, pattern = ".", replacement = "-", fixed = T)
+
+#load metadata
+metadata_PBTA <- read.csv('pbta_all_clinical_data.tsv', sep = '\t', header = T)
+metadata_PBTA$Sample.ID <- paste("X", metadata_PBTA$Sample.ID, sep = '')
+
+#Select interesting metadata columns
+cancertype <- metadata_PBTA[c("Sample.ID", "CANCER_TYPE","AGE", "EXPERIMENT_STRATEGY", "Number.of.Samples.Per.Patient", "SAMPLE_TYPE", "TUMOR_TYPE", "OS_STATUS")]
+
+#Select only the patients single sample, remove only wgs, remove patients older than 19,and with no histology annotation, select primary tumors only, select tumors with more than 19 patients, remove tumor types called 'other'
+cancertype <- cancertype[cancertype$Number.of.Samples.Per.Patient == 1,]
+cancertype <- cancertype[cancertype$EXPERIMENT_STRATEGY != 'WGS',]
+cancertype <- cancertype[cancertype$AGE < 19,]
+cancertype <- cancertype[!is.na(cancertype$CANCER_TYPE),]
+cancertype <- cancertype[cancertype$TUMOR_TYPE == "primary",]
+cancertype <- cancertype %>% group_by(CANCER_TYPE) %>% filter(n()>19)
+cancertype <- cancertype %>% filter(CANCER_TYPE != 'Other')
+```
+
+#Make expression matrix of left over patients
+```{r}
+#merge filtered patients with the expression data
+count_cantype <- left_join(cancertype, PBTA)
+count_cantype <- count_cantype[complete.cases(count_cantype), ]
+
+#make vector of all columns to exclude to make an expression matrix
+drops <- c("CANCER_TYPE","AGE", "EXPERIMENT_STRATEGY", "Number.of.Samples.Per.Patient", "SAMPLE_TYPE", "TUMOR_TYPE", "OS_STATUS")
+rna_seq_2 <- count_cantype[, !(names(count_cantype) %in% drops)]
+
+#make expression matrix 
+Sample_id <- rna_seq_2[,1]
+
+t <- t(rna_seq_2)
+t <- t %>% row_to_names(row_number = 1)
+t <- as.data.frame(t)
+
+expression_matrix <- as.matrix(t)
+```
+
+
+#load healthy brain bulk rna-seq from gtex 
+```{r}
+
+amygdala_df <- read.csv('gene_tpm_2017-06-05_v8_brain_amygdala.gct/gene_tpm_brain_amygdala.gct', sep = '\t', header = TRUE, skip = 2)
+ant_cortex <- read.csv('gene_tpm_2017-06-05_v8_brain_anterior_cingulate_cortex_ba24.gct/gene_tpm_brain_anterior_cingulate_cortex_ba24.gct', sep = '\t', header = TRUE, skip = 2)
+basal_ganglia_df <- read.csv('gene_tpm_2017-06-05_v8_brain_caudate_basal_ganglia.gct/gene_tpm_brain_caudate_basal_ganglia.gct', sep = '\t', header = TRUE, skip = 2)
+cerebellar_hem_df <- read.csv('gene_tpm_2017-06-05_v8_brain_cerebellar_hemisphere.gct/gene_tpm_brain_cerebellar_hemisphere.gct' , sep = '\t', header = TRUE, skip = 2)
+  cerebellum_df <- read.csv('gene_tpm_2017-06-05_v8_brain_cerebellum.gct/gene_tpm_brain_cerebellum.gct' , sep = '\t', header = TRUE, skip = 2)
+cortex_df <- read.csv('gene_tpm_2017-06-05_v8_brain_cortex.gct/gene_tpm_brain_cortex.gct', sep = '\t', header = TRUE, skip = 2)
+frontal_cortex_df <- read.csv('gene_tpm_2017-06-05_v8_brain_frontal_cortex_ba9.gct/gene_tpm_brain_frontal_cortex_ba9.gct', sep = '\t', header = T, skip = 2)
+hippocampus_df <- read.csv('gene_tpm_2017-06-05_v8_brain_hippocampus.gct/gene_tpm_brain_hippocampus.gct', sep = '\t', header = TRUE, skip = 2)
+hypothalamus_df <- read.csv('gene_tpm_2017-06-05_v8_brain_hypothalamus.gct/gene_tpm_brain_hypothalamus.gct', sep = '\t', header = TRUE, skip = 2)
+spinal_cord_df <- read.csv('gene_tpm_2017-06-05_v8_brain_spinal_cord_cervical_c-1.gct/gene_tpm_brain_spinal_cord_cervical_c-1).gct', sep = '\t', header = TRUE, skip = 2)
+substantia_nigra_df <- read.csv('gene_tpm_2017-06-05_v8_brain_substantia_nigra.gct/gene_tpm_brain_substantia_nigra.gct', sep = '\t', header = TRUE, skip = 2)
+
+
+#make list of all brain tissues
+brain_tissues_list <- list(amygdala = amygdala_df, 
+                           anterial_cortex = ant_cortex,
+                           basal_ganglia = basal_ganglia_df,
+                           cerebellar_hem = cerebellar_hem_df,
+                           cerebellum = cerebellum_df,
+                           cortex = cortex_df,
+                           frontal_cortex = frontal_cortex_df,
+                           hippocampus = hippocampus_df,
+                           hypothalamus = hypothalamus_df,
+                           spinal_cord = spinal_cord_df,
+                           substantia_nigra = substantia_nigra_df
+                           )
+```
+
+#prepare datasets for batch correction
+```{r}
+# Create an empty list to store batch_info dataframes for each tissue
+batch_info_list <- list()
+expression_list <- list()
+
+# Loop over each dataframe in the brain_tissues_list
+for (tissue_name in names(brain_tissues_list)) {
+    tissue_df <- brain_tissues_list[[tissue_name]]
+    # Create batch_info dataframe for the current tissue
+    batch_info <- data.frame(sample_id = names(tissue_df)[-c(1:3)],
+                             batch = paste("Healthy", tissue_name, sep = "_"))
+    rownames(batch_info) <- batch_info$sample_id
+    expr_mat <- tissue_df[, -c(1,2)]
+    # Store the batch_info dataframe in the list
+    batch_info_list[[tissue_name]] <- batch_info
+    expression_list[[tissue_name]] <- expr_mat
+}
+
+# Combine batch_info dataframes for all healthy tissues into a single dataframe for batch correction
+combined_batch_info <- do.call(rbind, batch_info_list)
+
+expression_matrix_healthy <- do.call(cbind, expression_list)
+colnames(expression_matrix_healthy)[1] <- 'gene_name'
+
+
+#prepare PBTA data for batch control
+batch_info_pbc <- data.frame(sample_id = names(t),
+                             batch = 'pbc')
+rownames(batch_info_pbc) <- batch_info_pbc$sample_id
+
+#combine batch information of healthy control with PBTA
+all_combined_batch_info <- rbind(combined_batch_info,  batch_info_pbc)
+
+
+#merge expression matrix healthy control with PBTA
+
+t$gene_name <- rownames(t)
+merged_df <- inner_join(expression_matrix_healthy, t, by = "gene_name")
+
+#remove duplicate genes
+merged_df <- merged_df[!duplicated(merged_df[,'gene_name']),]
+rownames(merged_df) <- merged_df$gene_name
+merged_df <- merged_df[,-1]
+```
+
+#Limma batch correction
+#Note, batch correction needs to be performed on log transformed counts!
+```{r}
+
+#make everything numerical values, if it gives an error of NA values induced check which column contains the strings
+your_data <- as.data.frame(apply(merged_df, 2, as.numeric))
+
+#Remove all columns containing NA values
+your_data <- your_data[colSums(!is.na(your_data)) > 0]
+
+# transform counts to log_counts, needed for batch correction, will make the data more normal distributed. Plus 1 is common for count data, this will handle cases where there are zeros in the original data.
+log_transformed_matrix <- as.data.frame(LogNormalize(your_data + 1))  # Adding 1 to avoid log(0)
+
+#update batch information since duplicate genes and NA values are removed
+batch_info_new <- data.frame(sample_id = names(merged_df))
+batch_info_new <- batch_info_new %>%
+  mutate(batch = ifelse(grepl("\\.", sample_id), sub("\\..*", "", sample_id), "pbc"))
+
+# extract batches and store it as vector
+batch <- batch_info_new$batch
+
+# Remove batch effects
+corrected_data <- removeBatchEffect(log_transformed_matrix, batch)
+```
+
+#merge corrected data with the metadata
+```{r}
+gene_names <- rownames(merged_df)
+
+healt_dis_rna <- data.frame(t(corrected_data))
+colnames(healt_dis_rna) <- gene_names
+healt_dis_rna <- tibble::rownames_to_column(healt_dis_rna, 'sample_id')
+
+#remove everything before the first occurrence of '.'
+healt_dis_rna$sample_id <- sub(".*?\\.", "", healt_dis_rna$sample_id)
+
+combined_batch_info$CANCER_TYPE <- combined_batch_info$batch
+
+#remove additional columns that are not used in further analysis
+drops2 <- c("EXPERIMENT_STRATEGY", "Number.of.Samples.Per.Patient", "SAMPLE_TYPE", "TUMOR_TYPE")
+metadata_PBTA <- metadata_PBTA[, !(names(metadata_PBTA) %in% drops2)]
+
+
+batch_info_pbc <- left_join(batch_info_pbc, metadata_PBTA, by = c('sample_id' = 'Sample.ID'))
+
+
+metdata_combined <- full_join(combined_batch_info, batch_info_pbc)
+
+corrected_withmeta <- full_join(metdata_combined, healt_dis_rna)
+corrected_withmeta <- corrected_withmeta[!is.na(corrected_withmeta$CANCER_TYPE),]
+
+
+#First make sure which columns are to be removed (for example duplicates, etc)
+rna_com_corr <- corrected_withmeta[, -c(4:34)]
+```
+
+
+#make everything z-scores
+```{r}
+#exclude metadata and exclude only expression matrix
+meta <- rna_com_corr[c('sample_id','batch','CANCER_TYPE')]
+exprs <- rna_com_corr[-c(1:3)]
+
+#scale the expression matrix
+z_expr <- sapply(exprs, function(exprs) (exprs-mean(exprs))/sd(exprs))
+
+#merge scaled with metadata
+rna_com_corr_z <- cbind(meta, z_expr)
+
+```
+
+
+#calculate gene set scores
+```{r}
+# load gene sets from paper: 'Single-cell Map of Diverse Immune Phenotypes in the Breast Tumor Microenvironment'
+gene_sig <- read.xlsx('NIHMS977868-supplement-12.xlsx', sheet = 1)
+gene_sig <- gene_sig %>% row_to_names(row_number = 1)
+
+#make list storing all gene sets
+gene_sets <- lapply(gene_sig, function(x) as.character(unlist(x)))
+
+
+# Initialize a list to store results for each histology
+result_list_z_len <- list()
+
+# Loop through unique histologies
+for (histology_type in unique(rna_com_corr_z$CANCER_TYPE)) {
+  # Subset the dataframe for the current histology
+  subset_df <- rna_com_corr_z[rna_com_corr_z$CANCER_TYPE == histology_type, ]
+  
+  # Initialize an empty dataframe to store gene set scores per sample
+  df_gene_set_scores <- data.frame(matrix(NA, nrow = length(gene_sets), ncol = nrow(subset_df)))
+  rownames(df_gene_set_scores) <- names(gene_sets)
+  colnames(df_gene_set_scores) <- subset_df$sample_id
+
+  # Initialize an empty list to store individual gene expression dataframes
+  list_gene_expression <- list()
+
+  # Calculate gene set scores for each sample
+  for (gene_set_name in names(gene_sets)) {
+    gene_set_genes <- gene_sets[[gene_set_name]]
+    
+    # Filter genes in the gene set that are present in the dataframe
+    present_genes <- gene_set_genes[gene_set_genes %in% colnames(subset_df)]
+    
+    for (i in seq_len(nrow(subset_df))) {
+      Sample_id <- subset_df$sample_id[i]
+      
+      # Calculate the gene set score by summing the expression values of genes in the gene set and correct for number of genes present (genelist length)
+      gene_set_score <- (sum(subset_df[i, present_genes], na.rm = TRUE))/length(present_genes)
+
+      # Store the gene set score in the dataframe
+      df_gene_set_scores[gene_set_name, Sample_id] <- gene_set_score
+    }
+
+    # Store individual gene expression values for present genes in the list
+    list_gene_expression[[gene_set_name]] <- subset_df[, c("sample_id", present_genes)]
+  }
+
+  # Store the results in the result_list
+  result_list_z_len[[histology_type]] <- list(
+    histology = histology_type,
+    gene_set_scores = df_gene_set_scores,
+    gene_expression = list_gene_expression
+  )
+}
+
+```
+
+#Get information regarding overall survival (OS)
+```{r}
+#OS metadata
+OS_data <- metadata_PBTA[,c('Sample.ID', 'OS_MONTHS', 'OS_STATUS')]
+colnames(OS_data)[1] <- 'sample_id'
+```
+
+#examples of visualizing gene sets scores in boxplots
+#functions should be loaded for this (in the rscript of functions)
+```{r}
+# Loop through each gene set to create plots for high/low grades
+for (gene_set_name in rownames(result_list_z_len[[1]]$gene_set_scores)) {
+  # Create a plot for each gene set
+  print(plot_gene_set_scores(gene_set_name, result_list_z_len, OS_data , grouping = 'OS'))
+}
+
+# Loop through each gene set to create plots for glial/non glial tumors
+for (gene_set_name in rownames(result_list[[1]]$gene_set_scores)) {
+  # Create a plot for each gene set
+  print(plot_gene_set_scores(gene_set_name, result_list_z_len, OS_data , grouping = 'cell_type'))
+}
+```
+
+#examples of visualizing gene sets scores in heatmaps
+#functions should be loaded for this (in the rscript of functions)
+```{r}
+# Loop through each gene set to create plots no grouping applied
+for (gene_set_name in rownames(result_list_z_len[[1]]$gene_set_scores)) {
+  # Create a plot for each gene set
+  print(plot_gene_set_heatmap(result_list_z_len,gene_set_name, OS_data))
+}
+
+```
+
+
+##Immune inhibitory receptors (IRs)
+#load predicted IRs
+```{r}
+pred_receptors <- read.csv('230620_predicted_receptors.txt', header = F)
+colnames(pred_receptors)[1] <- 'gene_name'
+
+#extract the expression of predicted IRs in dataframe including healthy control
+
+expr_pred_recpt_h <- rna_com_corr_z %>%
+  select(sample_id, CANCER_TYPE, intersect(colnames(rna_com_corr_z), pred_receptors$gene_name))
+
+
+long_novel_recpt_h <- expr_pred_recpt_h %>%
+  gather(key = "Gene", value = "Expression", -sample_id, -CANCER_TYPE)
+
+# Calculate median expression per gene and cancer type
+median_expression_novel_h <- long_novel_recpt_h %>%
+  group_by(Gene, CANCER_TYPE) %>%
+  summarize(Median_Expression = median(Expression, na.rm = TRUE))
+
+# Spread the data back into wide format
+df_wide_novel_h <- median_expression_novel_h %>%
+  spread(key = CANCER_TYPE, value = Median_Expression)
+
+
+median_pred_recpt_h <- df_wide_novel_h %>%
+  remove_rownames() %>%
+  column_to_rownames(var = "Gene")
+
+
+#Select IRs that have a higher median expressian than 0.5
+filtered_novel_ICI_h <- median_expression_novel_h %>%
+  group_by(CANCER_TYPE) %>%
+  filter_all(any_vars(Median_Expression > 0.5)) %>%
+  ungroup()
+```
+
+
+#Visualize IR expression in boxplots
+```{r}
+#Example visualize top IR expression per tumor type
+# Example usage for all cancer types:
+for (ct in unique(filtered_novel_ICI_h$CANCER_TYPE)) {
+  # Create a plot for each gene set
+  print(plot_inhibitory_receptor_expression(ct, filtered_novel_ICI_h, long_novel_recpt_h))
+}
+#example usage for a single tumor type
+print(plot_inhibitory_receptor_expression("High-grade glioma/astrocytoma (WHO grade III/IV)", filtered_novel_ICI_h, long_novel_recpt_h))
+```
+
+
+#OVerall survival correlation with specific genes
+```{r}
+
+#select a cancer type of interest
+cancer_type_of_interest <- "Ependymoma"
+
+#select gene of interest
+gene_of_interest <- c("TYROBP")  # Specify the genes you're interested in
+relevant_columns <- c("OS_MONTHS", "OS_STATUS", gene_of_interest)
+
+selected_data <- count_cantype %>% filter(CANCER_TYPE == cancer_type_of_interest) %>%
+  select(all_of(relevant_columns))
+
+
+# Calculate quantiles for the gene of interest
+quantiles <- quantile(selected_data$TYROBP, probs = c(0.33, 0.66), na.rm = TRUE)
+
+# Categorize gene expression based on quantiles
+Tyrobp_df <- selected_data %>%
+  mutate(TYROBP = case_when(
+    TYROBP <= quantiles[1] ~ "low",
+    TYROBP > quantiles[1] & TYROBP <= quantiles[2] ~ "medium",
+    TYROBP > quantiles[2] ~ "high"
+  ))
+
+#replace survival status to binary classifcation
+Tyrobp_df$OS_STATUS <- ifelse(Tyrobp_df$OS_STATUS == "0:LIVING", 0, 1)
+
+#Make survival object
+surv_object <- Surv(time = Tyrobp_df$OS_MONTHS, event = Tyrobp_df$OS_STATUS)
+
+#fit the survival object
+fit <- survfit(surv_object ~ Tyrobp_df$TYROBP, data = Tyrobp_df)
+
+#make kaplan meier plot
+ggsurvplot(fit, data = Tyrobp_df, 
+           pval = TRUE, 
+           conf.int = TRUE, 
+           risk.table = TRUE, 
+           legend.labs = c("Low expression", "Medium expression", "High expression"),
+           title = "Kaplan-Meier Curve for TYROBP in Ependymoma",
+           xlab = "Time in Months",
+           ylab = "Overall Survival Probability")
+```
+
