@@ -1,0 +1,289 @@
+---
+title: "Functions for bulk analysis"
+output: html_notebook
+---
+
+
+#function to plot gene set scores
+```{r}
+#' Plot Gene Set Scores by Histology and Grouping
+#'
+#' This function generates a boxplot of gene set scores for different histology types, optionally grouped by grade, cell type, or overall survival (OS) status.
+#'
+#' @param gene_set_name A string representing the name of the gene set to be plotted.
+#' @param result_list A named list of results, where each element corresponds to a histology type and contains a data frame with gene set scores.
+#' @param OS_data A data frame containing overall survival data with columns for sample IDs and OS status.
+#' @param grouping A string specifying the type of grouping to apply to the data. Possible values are 'grade', 'cell_type', 'OS', or NULL. If NULL, no additional grouping is applied.
+#'
+#' @return A ggplot object displaying the boxplot of gene set scores.
+#'
+#' @details
+#' The function first defines vectors for high-grade and low-grade histologies, as well as glial and non-glial histologies. It then iterates through each histology type in `result_list`, extracts the gene set scores for the specified `gene_set_name`, and reshapes the data for plotting.
+#'
+#' If a `grouping` parameter is provided, the data is grouped accordingly:
+#' - 'grade': Groups histologies into 'High Grade', 'Low Grade', 'Healthy', or 'Other'.
+#' - 'cell_type': Groups histologies into 'Glial', 'Non-Glial', 'Healthy', or 'Other'.
+#' - 'OS': Joins the data with `OS_data` and groups samples by 'Living', 'Deceased', or 'Healthy'.
+#'
+#' The function combines the data frames for all histologies and creates a ggplot object showing the gene set scores by group, with boxplots and individual points.
+#'
+#' @examples
+#' \dontrun{
+#' # Assuming result_list and OS_data are already defined
+#' plot_gene_set_scores("example_gene_set", result_list, OS_data, grouping = "grade")
+#' }
+
+
+plot_gene_set_scores <- function(gene_set_name, result_list, OS_data ,grouping = NULL) {
+  # Create a list to store data frames for each histology
+  
+  histology_dfs <- list()
+  
+  # Define vectors for grouping
+  high_grade_histologies <- c('High-grade glioma astrocytoma', 'Medulloblastoma', 'Diffuse midline glioma', 'Atypical Teratoid Rhabdoid Tumor', 'Ependymoma')
+  low_grade_histologies <- c('Pilocytic astrocytoma', 'Low-grade glioma astrocytoma', 'Ganglioglioma', 'Craniopharyngioma', 'Dysembryoplastic neuroepithelial tumor')
+  glial_histologies <- c('Pilocytic astrocytoma','Low-grade glioma astrocytoma', 'High-grade glioma astrocytoma', 'Ependymoma')
+  non_glial_histologies <- c('Medulloblastoma', 'Atypical Teratoid Rhabdoid Tumor', 'Craniopharyngioma')
+  
+  # Loop through each histology
+  for (histology_type in names(result_list)) {
+    df <- result_list[[histology_type]]$gene_set_scores[gene_set_name,]
+    
+    # Reshape the dataframe for ggplot
+    df_long <- tidyr::gather(df, key = "sample_id", value = "gene_set_score")
+    
+    # Grouping based on parameters
+    if (!is.null(grouping)) {
+      if (grouping == 'grade') {
+        if (histology_type %in% high_grade_histologies) {
+          df_long$group <- 'High Grade'
+        } else if (histology_type %in% low_grade_histologies) {
+          df_long$group <- 'Low Grade'
+        } else if (grepl("^healthy", histology_type, ignore.case = TRUE)) {
+          df_long$group <- 'Healthy'
+        } else {
+          df_long$group <- 'Other'
+        }
+      } else if (grouping == 'cell_type') {
+        if (histology_type %in% glial_histologies) {
+          df_long$group <- 'Glial'
+        } else if (histology_type %in% non_glial_histologies) {
+          df_long$group <- 'Non-Glial'
+        } else if (grepl("^healthy", histology_type, ignore.case = TRUE)) {
+          df_long$group <- 'Healthy'
+        } else {
+          df_long$group <- 'Other'
+        }
+      } else if (grouping == 'OS') {
+        df_long <- dplyr::left_join(df_long, OS_data, by = 'sample_id')
+        # Create subgroups based on survival status
+        if (grepl("^healthy", histology_type, ignore.case = TRUE)) {
+          df_long$group <- 'healty'
+        } else {
+          df_long$group <- ifelse(is.na(df_long$OS_STATUS), 'other', 
+                                  ifelse(df_long$OS_STATUS == '0:LIVING', 'Living', 'Deceased'))
+        }
+      } else {
+        warning("Invalid grouping parameter. No grouping applied.")
+        df_long$group <- 'Other'
+      }
+    } else {
+      df_long$group <- histology_type
+    }
+    
+    # Store the dataframe in the list
+    histology_dfs[[histology_type]] <- df_long
+  }
+  
+  # Combine data frames for all histologies
+  df_combined <- do.call(rbind, histology_dfs)
+  
+  
+  # Create a combined plot
+  ggplot(df_combined, aes(x = group, y = gene_set_score, fill = group)) +
+    geom_boxplot(notch = TRUE) +
+    geom_point(position = position_dodge(width = 0.9), size = 1, color = "black") +
+    labs(title = paste("Gene Set:", gene_set_name),
+         x = "Group", y = "Gene Set Score") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+}
+```
+
+
+#function for heatmaps gene set scores
+```{r}
+#' Plot Heatmap of Gene Set Expression by Histology and Grouping
+#'
+#' This function generates a heatmap of gene expression levels for a specified gene set across different histology types, optionally grouped by grade, cell type, or overall survival (OS) status.
+#'
+#' @param gene_set A named list of results, where each element corresponds to a histology type and contains data frames with gene set scores and gene expression data.
+#' @param gene_set_name A string representing the name of the gene set to be plotted.
+#' @param OS_data A data frame containing overall survival data with columns for sample IDs and OS status.
+#' @param grouping A string specifying the type of grouping to apply to the data. Possible values are 'grade', 'cell_type', 'OS', or NULL. If NULL, no additional grouping is applied.
+#'
+#' @return A ggplot object displaying the heatmap of gene expression levels.
+#'
+#' @details
+#' The function first defines vectors for high-grade and low-grade histologies, as well as glial and non-glial histologies. It then iterates through each histology type in `gene_set`, extracts the gene set scores and gene expression data for the specified `gene_set_name`, and reshapes the data for plotting.
+#'
+#' If a `grouping` parameter is provided, the data is grouped accordingly:
+#' - 'grade': Groups histologies into 'High Grade', 'Low Grade', 'Healthy', or 'Other'.
+#' - 'cell_type': Groups histologies into 'HG_Glial', 'LG_Glial', 'HG_Non_Glial', 'LG_Non_Glial', 'Healthy', or 'Other'.
+#' - 'OS': Joins the data with `OS_data` and groups samples by 'Living', 'Deceased', or 'Healthy'.
+#'
+#' The function combines the data frames for all histologies, filters out 'Healthy' samples, and calculates the median expression level for each gene-group combination. It then creates a ggplot object showing the heatmap of gene expression levels by group.
+#'
+#' @examples
+#' \dontrun{
+#' # Assuming gene_set and OS_data are already defined
+#' plot_gene_set_heatmap(gene_set, "example_gene_set", OS_data, grouping = "cell_type")
+#' }
+
+# Create a function to generate a heatmap for each gene set
+plot_gene_set_heatmap <- function(gene_set, gene_set_name, OS_data ,grouping = NULL) {
+  # Create a list to store data frames for each histology
+  histology_dfs <- list()
+  
+  # Define vectors for grouping
+  high_grade_histologies <- c('High-grade glioma/astrocytoma (WHO grade III/IV)', 'Medulloblastoma', 'Diffuse midline glioma', 'Atypical Teratoid Rhabdoid Tumor (ATRT)', 'Ependymoma', 'Brainstem glioma- Diffuse intrinsic pontine glioma')
+  low_grade_histologies <- c('Pilocytic astrocytoma', 'Low-grade glioma/astrocytoma (WHO grade I/II)', 'Ganglioglioma', 'Craniopharyngioma', 'Dysembryoplastic neuroepithelial tumor (DNET)', 'Choroid plexus papilloma', 'Meningioma')
+  high_grade_glial <- c('High-grade glioma/astrocytoma (WHO grade III/IV)', 'Ependymoma', 'Brainstem glioma- Diffuse intrinsic pontine glioma', 'Diffuse midline glioma')
+  low_grade_glial <- c('Low-grade glioma/astrocytoma (WHO grade I/II)', 'Ganglioglioma', 'Dysplasia/Gliosis', 'Choroid plexus papilloma' , 'Dysembryoplastic neuroepithelial tumor (DNET)')
+  high_grade_non_glial <- c('Medulloblastoma', 'Atypical Teratoid Rhabdoid Tumor (ATRT)')
+  low_grade_non_glial <- c('Craniopharyngioma', 'Choroid plexus papilloma')
+  
+  # Loop through each histology
+  for (histology_type in names(gene_set)) {
+    df_gene_set_scores <- gene_set[[histology_type]]$gene_set_scores
+    
+    # Extract individual gene expression dataframe
+    df_gene_expression <- gene_set[[histology_type]]$gene_expression[[gene_set_name]]
+    gene_names_present <- colnames(df_gene_expression[, sapply(df_gene_expression, is.numeric)])
+    gene_col_index <- match(gene_names_present, names(df_gene_expression))
+    
+    # Reshape the dataframe for heatmap
+    df_long <- tidyr::gather(df_gene_expression, key = "gene", value = 'expression', gene_col_index)
+    
+    # Grouping based on parameters
+    if (!is.null(grouping)) {
+      if (grouping == 'grade') {
+        if (histology_type %in% high_grade_histologies) {
+          df_long$group <- 'High Grade'
+        } else if (histology_type %in% low_grade_histologies) {
+          df_long$group <- 'Low Grade'
+        } else if (grepl("^healthy", histology_type, ignore.case = TRUE)) {
+          df_long$group <- 'Healthy'
+        } else {
+          df_long$group <- 'Other'
+        }
+      } else if (grouping == 'cell_type') {
+        if (histology_type %in% high_grade_glial) {
+          df_long$group <- 'HG_Glial'
+        } else if (histology_type %in% low_grade_glial) {
+          df_long$group <- 'LG_Glial'
+        } else if (histology_type %in% high_grade_non_glial) {
+          df_long$group <- 'HG_Non_Glial'
+        } else if (histology_type %in% low_grade_non_glial) {
+          df_long$group <- 'LG_Non_Glial'
+        } else if (grepl("^healthy", histology_type, ignore.case = TRUE)) {
+          df_long$group <- 'Healthy'
+        } else {
+          df_long$group <- 'Other'
+        }
+      } else if (grouping == 'OS') {
+        df_long <- dplyr::left_join(df_long, OS_data, by = 'Sample.ID')
+        # Create subgroups based on survival status
+        if (grepl("^healthy", histology_type, ignore.case = TRUE)) {
+          df_long$group <- 'Healthy'
+        } else {
+          df_long$group <- ifelse(is.na(df_long$OS_STATUS), 'other', 
+                                  ifelse(df_long$OS_STATUS == '0:LIVING', 'Living', 'Deceased'))
+        }
+      } else {
+        warning("Invalid grouping parameter. No grouping applied.")
+        df_long$group <- 'Other'
+      }
+    } else {
+      df_long$group <- histology_type
+    }
+    
+    # Store the dataframe in the list
+    histology_dfs[[histology_type]] <- df_long
+  }
+  
+  # Combine data frames for all histologies
+  df_combined <- do.call(rbind, histology_dfs)
+  df_combined <- df_combined %>% filter(!startsWith(group, "Healthy"))
+  df_combined <- df_combined[complete.cases(df_combined),]
+
+  df_combined_2 <- aggregate(df_combined$expression, by = list(df_combined$gene, df_combined$group), FUN = median)
+  colnames(df_combined_2) <- c('gene', 'group', 'expression')
+  df_combined_2 <- df_combined_2 %>% filter(group != 'Other')
+
+  
+  g <- ggplot(df_combined_2, aes(gene, group, fill = expression)) +
+    geom_tile()+
+    scale_fill_gradient2(low = "#075AFF",
+                       mid = "#FFFFFF",
+                       high = "#FF0000") +
+    labs(title = paste("Gene Set:", gene_set_name),
+         x = "Genes", y = "group") +
+    theme(axis.text.x = element_text(angle = 46, hjust = 1))
+  g <- g +theme(axis.text = element_text(size = 16), axis.title = element_text((size = 14)))
+  
+  print(g)
+
+}  
+```
+
+
+#function IR top 10 expression per cancer type
+```{r}
+#' Plot Inhibitory Receptor Expression for a Given Cancer Type
+#'
+#' This function generates a boxplot of the expression levels of the top 10 inhibitory receptor genes for a specified cancer type.
+#'
+#' @param cancer_type A string representing the cancer type for which the inhibitory receptor expression is to be plotted.
+#' @param filtered_novel_ICI_h A data frame containing information on inhibitory receptor genes, including their median expression values for different cancer types.
+#' @param long_novel_recpt_h A data frame containing the long-format expression data for inhibitory receptor genes across different cancer types.
+#'
+#' @return A ggplot object displaying the boxplot of inhibitory receptor gene expression.
+#'
+#' @details
+#' The function first filters the `filtered_novel_ICI_h` data frame to extract the top 10 genes with the highest median expression for the given `cancer_type`. It then filters the `long_novel_recpt_h` data frame to include only the expression data for the specified `cancer_type` and the top 10 genes.
+#'
+#' The function creates a boxplot of the expression levels of these genes and customizes the plot appearance with larger font sizes and angled x-axis labels for better readability. The resulting plot is saved as a PNG file.
+#'
+#' @examples
+#' \dontrun{
+#' # Assuming filtered_novel_ICI_h and long_novel_recpt_h are already defined
+#' plot_inhibitory_receptor_expression("Lung Cancer", filtered_novel_ICI_h, long_novel_recpt_h)
+#' }
+
+
+plot_inhibitory_receptor_expression <- function(cancer_type, filtered_novel_ICI_h, long_novel_recpt_h ) {
+  # Extract the top 10 genes for the given cancer type
+  IR <- filtered_novel_ICI_h %>% filter(CANCER_TYPE == cancer_type) %>% arrange(desc(Median_Expression))
+  IR_top_10 <- IR[1:10,]
+  genes_top <- IR_top_10$Gene
+  
+  # Filter the data based on the cancer type and the top genes
+  filtered <- long_novel_recpt_h %>%
+    filter(CANCER_TYPE == cancer_type & Gene %in% genes_top)
+  
+  # Create the boxplot
+  ggplot(filtered, aes(x = Gene, y = Expression)) + 
+    geom_boxplot() +
+    labs(title = paste(cancer_type, "Inhibitory Receptor Expression"),
+         x = "Gene Name", y = "Expression (z-scores)")+
+         theme(
+      plot.title = element_text(size = 28, hjust = 0.5),  # Increase title size
+      axis.title.x = element_text(size = 26),  # Increase x-axis title size
+      axis.title.y = element_text(size = 26),  # Increase y-axis title size
+      axis.text.x = element_text(size = 22, angle = 45, hjust = 1),  # Increase x-axis text size and angle
+      axis.text.y = element_text(size = 22)  # Increase y-axis text size
+    )
+  #ggsave(paste(ct,"IR_bulk.png", sep = ''), width = 15, height = 8, units = 'in', dpi = 700)
+}
+```
