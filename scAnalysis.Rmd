@@ -1,0 +1,204 @@
+---
+title: "Single-Cell analysis"
+output: html_notebook
+---
+
+#load required functions
+```{r}
+library(Seurat)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(janitor)
+library(ggplot2)
+```
+
+
+#load scdata
+```{r}
+#load the count matrix
+sc_raw <- read.csv('GSE125969_count_matrix.tsv/GSE125969_count_matrix.tsv', sep = '\t',header = T)
+
+#make expression matrix for the Seurat object from the count matrix
+expr_mat <- sc_raw[,-1]
+rownames(expr_mat) <- scEpen_raw[,1]
+
+#load the metadata for the count matrix
+sc_metadata <- read.csv('GSE125969_cell_metadata.tsv/GSE125969_cell_metadata.tsv', sep = '\t', header = T)
+rownames(sc_metadata) <- sc_metadata[,1]
+
+```
+
+
+#make a seurat object
+```{r}
+
+#Make an assay object of the counts
+pbmc <- CreateAssay5Object(counts = expr_epen)
+Seurat <- CreateSeuratObject(counts = pbmc, project = "scEpendymoma")
+
+#Retrieve metadata and add additional metadata
+CellMeta <- Seurat@meta.data
+cellMeta_new <- cbind(CellMeta, sc_metadata)
+Seurat <- AddMetaData(Seurat, cellMeta_new)
+
+#Calculate mitochondrial gene content percentage
+Ependymoma_seurat[['percent.mt']] <- PercentageFeatureSet(Ependymoma_seurat, pattern = "^MT-")
+
+#quality filter on cells with less than 200 genes expressing and higher than 15 percent mitochondrial content
+Seurat <- subset(Seurat, subset = nFeature_RNA > 200 & percent.mt < 15)
+
+
+#Find variable featues and normalize seurat object
+#renaming the object so the seurat object won't change (this is needed later)
+Seurat_all <- FindVariableFeatures(Seurat, selection.method = 'vst', nfeatures = 2000)
+Seurat_all <- NormalizeData(Ependymoma_seurat, normalization.method = "LogNormalize", scale.factor = 10000)
+
+
+#scale data
+all.genes <- rownames(Seurat_all)
+Seurat_all <- ScaleData(Seurat_all, features = all.genes)
+
+
+#perform PCA
+Seurat_all <- RunPCA(Seurat_all, features = VariableFeatures(object = Seurat_all))
+
+#to visualize the principal components explaining most variance
+#according to this set the dimensions in the following line
+ElbowPlot(Seurat_all)
+
+#Find clusters based on most PCs explaining the most variance
+Seurat_all <- FindNeighbors(Seurat_all, dims = 1:20)
+Seurat_all <- FindClusters(Seurat_all, resolution = 0.5)
+
+#Run UMAP
+Seurat_all <- RunUMAP(Seurat_all, dims = 1:20)
+
+
+
+#Visualizing the data using umap
+#DimPlot(Seurat_all, reduction = "umap")
+
+#visualizing the data using 'cell_type' from metadata as annotation
+#DimPlot(Seurat_all, reduction = "umap", label = T, group.by = "cell_type")
+```
+
+
+#subset in seurat objects with  only immune cells
+```{r}
+#select only cells that are lymphocytes and myeloid cells (this was in the metadata)
+immune_keep <- which(Seurat@meta.data$cell_type == 'Lymphocytes' | Seurat@meta.data$cell_type == 'Myeloid')
+immune_seurat <- Seurat[, immune_keep]
+
+#find variable features and normalize the data
+immune_seurat <- FindVariableFeatures(immune_seurat, selection.method = 'vst', nfeatures = 2000)
+immune_seurat <- NormalizeData(immune_seurat, normalization.method = "LogNormalize", scale.factor = 10000)
+
+#scale the data
+all.immunegenes <- rownames(immune_seurat)
+immune_seurat <- ScaleData(immune_seurat, features = all.immunegenes)
+
+#run PCA on immune cells
+immune_seurat<- RunPCA(immune_seurat, features = VariableFeatures(object = immune_seurat))
+
+#to visualize the principal components explaining most variance
+#according to this set the dimensions in the following line
+ElbowPlot(immune_seurat)
+
+#clustering
+immune_seurat <- FindNeighbors(immune_seurat, dims = 1:15)
+immune_seurat <- FindClusters(immune_seurat, resolution = 0.5)
+
+#run UMAP
+immune_seurat <- RunUMAP(immune_seurat, dims = 1:15)
+
+
+
+#calculate markers to assign cell state
+immune.markers <- FindAllMarkers(immune_seurat, only.pos = T)
+
+#Assign cell states based on cluster markers
+#adjust this to the cluster markers found in your dataset
+#new.clusters.ids <- c("Macrophages", "NA microglia", "T cells", "Neutrophil/monocytes", "Macrophrages","Neutrophil/monocytes", "B-cells", "Proliferate", "Dendritic cell like Macrophages", "Macrophages","NA microglia", "NK cells", "Macrophages")
+#names(new.clusters.ids) <- levels(immune_seurat)
+#immune_seurat <- RenameIdents(immune_seurat, new.clusters.ids)
+
+#visualize immune cells with new annotation
+DimPlot(immune_seurat, reduction = 'umap', label = T)
+
+#Calculate macrophages markers compared to all other cell states
+#If you want to calculate markers specific compared to one state, include ident.2 and specify to what other cell state you want to compare
+macrophages.markers <- FindMarkers(immune_seurat, ident.1 = "Macrophages")
+macrophages.markers$gene_name <- rownames(macrophages.markers)
+
+```
+
+
+#Inhibitory receptors
+```{r}
+#load predicted IRs by singh et all preprint
+pred_receptors <- read.csv('230620_predicted_receptors.txt', header = F)
+colnames(pred_receptors)[1] <- 'gene_name'
+
+#join predicted IR with markers for macrophages to get an idea on the expression of the predicted IR on macrophages
+IR_markers_immune <- left_join(pred_receptors, macrophages.markers)
+
+```
+
+
+#calculate percentage cells expressing IR per cell state
+```{r}
+#if you want to calculate for all genes use the line below
+#all_features <- rownames(immune_seurat@assays[["RNA"]]$counts)
+
+#selecting IRs markers in macrophages
+all_features <- rownames(IR_markers_immune)
+
+# Initialize a list to store the percentage expression for each feature
+percentage_macrophages<- list()
+
+
+for (feature in all_features) {
+    # Get the expression data for the feature
+    feature_expression <- GetAssayData(object = immune_seurat, assay = 'RNA')[feature, , drop = FALSE]
+    
+    # Get the total number of cells in each group
+    total_cells_per_group <- table(immune_seurat@active.ident)
+    
+    # Initialize a vector to store the percentage expression in each group
+    percentage_expressing <- rep(NA, length(unique(immune_seurat@active.ident)))
+    
+    # Calculate the percentage expression of the feature in each group
+    for (group_id in unique(immune_seurat@active.ident)) {
+        cells_in_group <- which(immune_seurat@active.ident == group_id)
+        expressing_cells <- sum(feature_expression[, cells_in_group] > 0)
+        percentage_expressing[group_id] <- expressing_cells / total_cells_per_group[group_id] * 100
+    }
+    
+    # Store the percentage expression in the list
+    percentage_macrophages[[feature]] <- percentage_expressing
+}
+
+
+#transform the list back into dataframe
+feature_expr_macro <- do.call(cbind, percentage_macrophages)
+feature_expr_macro <- t(feature_expr_macro)
+feature_expr_macro <- as.data.frame(feature_expr_macro)
+feature_expr_macro$gene_name <- rownames(feature_expr_macro)
+
+
+#add the percentage expressing to the IR markers for macrophages
+DEG_macro_expr <- left_join(IR_markers_immune, feature_expr_macro)
+```
+
+
+#visualization with most expressed IR in macrophages
+```{r}
+#dotplot
+DotPlot(immune_seurat, features = c("ITM2B", "TYROBP", "VSIG4", "SLC11A1", "HLA-DMB", "IER3", "CD68", "CD81", "CXCL16","LST1"))
+
+#featureplot
+FeaturePlot(immune_seurat, features = c("ITM2B", "TYROBP", "VSIG4", "SLC11A1", "HLA-DMB", "IER3", "CD68", "CD81", "CXCL16","LST1"))
+
+```
+
